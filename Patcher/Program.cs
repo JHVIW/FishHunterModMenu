@@ -43,7 +43,10 @@ PatchCurrencyAdd(currencyType);
 Console.WriteLine("[*] Patch 5: Max level (GetLevelForExp returns last level)...");
 PatchMaxLevel();
 
-Console.WriteLine("[*] Patch 6: 3x inventory slot capacity...");
+Console.WriteLine("[*] Patch 6: Infinite ammo...");
+PatchInfiniteAmmo();
+
+Console.WriteLine("[*] Patch 7: 3x inventory slot capacity...");
 PatchInventoryCapacity();
 
 if (patchCount > 0)
@@ -164,6 +167,37 @@ void PatchCurrencyAdd(TypeDefinition? type)
     il.InsertBefore(first, il.Create(OpCodes.Starg, method.Parameters[1]));
     patchCount++;
     Console.WriteLine("    [OK] Add always adds 999999 regardless of input");
+}
+
+void PatchInfiniteAmmo()
+{
+    var bulletsType = module.Types.FirstOrDefault(
+        t => t.FullName == "Features.Shooting.MyBulletsInventory");
+    if (bulletsType == null) { Console.WriteLine("    [!] MyBulletsInventory not found"); return; }
+
+    // GetBulletsCount(Id) -> always return 999
+    var getCount = bulletsType.Methods.FirstOrDefault(
+        m => m.Name == "GetBulletsCount" && m.Parameters.Count == 1);
+    if (getCount != null)
+    {
+        var il = getCount.Body.GetILProcessor();
+        getCount.Body.Instructions.Clear();
+        il.Append(il.Create(OpCodes.Ldc_I4, 999));
+        il.Append(il.Create(OpCodes.Ret));
+        patchCount++;
+        Console.WriteLine("    [OK] GetBulletsCount always returns 999");
+    }
+
+    // CostBullets -> no-op (never consume ammo)
+    var cost = bulletsType.Methods.FirstOrDefault(m => m.Name == "CostBullets");
+    if (cost != null)
+    {
+        var il = cost.Body.GetILProcessor();
+        cost.Body.Instructions.Clear();
+        il.Append(il.Create(OpCodes.Ret));
+        patchCount++;
+        Console.WriteLine("    [OK] CostBullets is now a no-op");
+    }
 }
 
 void PatchMaxLevel()
