@@ -6,7 +6,7 @@ Built for singleplayer use only. Fish Hunters is a Unity game using FishNet netw
 
 ## Features
 
-Press **F8** in-game to open the mod menu. All toggles are enabled by default and can be switched on/off live.
+Press **F8** in-game to open the mod menu (centered on screen). All cheats are **disabled by default** — click a toggle to enable it, click again to disable.
 
 | Toggle | Description |
 |--------|-------------|

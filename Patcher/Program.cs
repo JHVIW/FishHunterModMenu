@@ -68,6 +68,9 @@ var dontDestroyOnLoad = module.ImportReference(unityObjectDef.Methods.First(m =>
     m.Name == "DontDestroyOnLoad"));
 var runtimeInitCtor = module.ImportReference(runtimeInitAttrDef.Methods.First(m =>
     m.IsConstructor && m.Parameters.Count == 1));
+var screenDef = unityCoreAsm.MainModule.Types.First(t => t.FullName == "UnityEngine.Screen");
+var screenGetWidth = module.ImportReference(screenDef.Methods.First(m => m.Name == "get_width"));
+var screenGetHeight = module.ImportReference(screenDef.Methods.First(m => m.Name == "get_height"));
 
 // Resolve System.Type.GetTypeFromHandle from corlib
 var corlib = module.TypeSystem.Object.Resolve().Module;
@@ -102,19 +105,18 @@ foreach (var name in toggleNames)
 var menuOpenField = new FieldDefinition("MenuOpen",
     FieldAttributes.Public | FieldAttributes.Static, module.TypeSystem.Boolean);
 configType.Fields.Add(menuOpenField);
+var initializedField = new FieldDefinition("Initialized",
+    FieldAttributes.Public | FieldAttributes.Static, module.TypeSystem.Boolean);
+configType.Fields.Add(initializedField);
 
-// Static constructor: set all toggles to true
+// Static constructor: all toggles OFF by default
 var cctor = new MethodDefinition(".cctor",
     MethodAttributes.Static | MethodAttributes.Private |
     MethodAttributes.SpecialName | MethodAttributes.RTSpecialName | MethodAttributes.HideBySig,
     module.TypeSystem.Void);
 {
     var il = cctor.Body.GetILProcessor();
-    foreach (var f in toggleFields.Values)
-    {
-        il.Append(il.Create(OpCodes.Ldc_I4_1));
-        il.Append(il.Create(OpCodes.Stsfld, f));
-    }
+    // bools default to false already, just need ret
     il.Append(il.Create(OpCodes.Ret));
 }
 configType.Methods.Add(cctor);
@@ -144,10 +146,10 @@ var controllerType = new TypeDefinition("", "ModMenuController",
     controllerType.Methods.Add(ctor);
 }
 
-// Static Init() with [RuntimeInitializeOnLoadMethod(AfterSceneLoad)]
+// Static Init() — called from Tick() bootstrap
 {
     var init = new MethodDefinition("Init",
-        MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig,
+        MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
         module.TypeSystem.Void);
     var il = init.Body.GetILProcessor();
     // var go = new GameObject("FishHunterModMenu");
@@ -162,13 +164,6 @@ var controllerType = new TypeDefinition("", "ModMenuController",
     // DontDestroyOnLoad(go);
     il.Append(il.Create(OpCodes.Call, dontDestroyOnLoad));
     il.Append(il.Create(OpCodes.Ret));
-
-    var attr = new CustomAttribute(runtimeInitCtor);
-    attr.ConstructorArguments.Add(new CustomAttributeArgument(
-        module.ImportReference(runtimeInitAttrDef.Methods.First(m =>
-            m.IsConstructor && m.Parameters.Count == 1).Parameters[0].ParameterType),
-        1)); // RuntimeInitializeLoadType.AfterSceneLoad
-    init.CustomAttributes.Add(attr);
     controllerType.Methods.Add(init);
 }
 
@@ -213,11 +208,16 @@ var controllerType = new TypeDefinition("", "ModMenuController",
     controllerType.Methods.Add(update);
 }
 
-// OnGUI() — draw mod menu
+// OnGUI() — draw centered mod menu
 {
     var onGui = new MethodDefinition("OnGUI",
         MethodAttributes.Private | MethodAttributes.HideBySig,
         module.TypeSystem.Void);
+    // Local variables: float ox, float oy (menu origin x/y)
+    onGui.Body.Variables.Add(new VariableDefinition(module.TypeSystem.Single)); // loc0 = ox
+    onGui.Body.Variables.Add(new VariableDefinition(module.TypeSystem.Single)); // loc1 = oy
+    onGui.Body.InitLocals = true;
+
     var il = onGui.Body.GetILProcessor();
     var ret = il.Create(OpCodes.Ret);
 
@@ -225,20 +225,42 @@ var controllerType = new TypeDefinition("", "ModMenuController",
     il.Append(il.Create(OpCodes.Ldsfld, menuOpenField));
     il.Append(il.Create(OpCodes.Brfalse, ret));
 
-    // Helper: emit new Rect(x,y,w,h)
-    void EmitRect(float x, float y, float w, float h)
+    // ox = (Screen.width - 260) / 2
+    il.Append(il.Create(OpCodes.Call, screenGetWidth));
+    il.Append(il.Create(OpCodes.Ldc_I4, 260));
+    il.Append(il.Create(OpCodes.Sub));
+    il.Append(il.Create(OpCodes.Ldc_I4_2));
+    il.Append(il.Create(OpCodes.Div));
+    il.Append(il.Create(OpCodes.Conv_R4));
+    il.Append(il.Create(OpCodes.Stloc_0));
+
+    // oy = (Screen.height - 310) / 2
+    il.Append(il.Create(OpCodes.Call, screenGetHeight));
+    il.Append(il.Create(OpCodes.Ldc_I4, 310));
+    il.Append(il.Create(OpCodes.Sub));
+    il.Append(il.Create(OpCodes.Ldc_I4_2));
+    il.Append(il.Create(OpCodes.Div));
+    il.Append(il.Create(OpCodes.Conv_R4));
+    il.Append(il.Create(OpCodes.Stloc_1));
+
+    // Helper: emit new Rect(ox+dx, oy+dy, w, h)
+    void EmitRect(float dx, float dy, float w, float h)
     {
-        il.Append(il.Create(OpCodes.Ldc_R4, x));
-        il.Append(il.Create(OpCodes.Ldc_R4, y));
+        il.Append(il.Create(OpCodes.Ldloc_0));
+        il.Append(il.Create(OpCodes.Ldc_R4, dx));
+        il.Append(il.Create(OpCodes.Add));
+        il.Append(il.Create(OpCodes.Ldloc_1));
+        il.Append(il.Create(OpCodes.Ldc_R4, dy));
+        il.Append(il.Create(OpCodes.Add));
         il.Append(il.Create(OpCodes.Ldc_R4, w));
         il.Append(il.Create(OpCodes.Ldc_R4, h));
         il.Append(il.Create(OpCodes.Newobj, rectCtor));
     }
 
     // Helper: emit a toggle row
-    void EmitToggle(float y, FieldDefinition field, string label)
+    void EmitToggle(float dy, FieldDefinition field, string label)
     {
-        EmitRect(30f, y, 220f, 25f);
+        EmitRect(10f, dy, 240f, 25f);
         il.Append(il.Create(OpCodes.Ldsfld, field));
         il.Append(il.Create(OpCodes.Ldstr, label));
         il.Append(il.Create(OpCodes.Call, guiToggle));
@@ -246,12 +268,12 @@ var controllerType = new TypeDefinition("", "ModMenuController",
     }
 
     // Background box
-    EmitRect(20f, 20f, 260f, 310f);
+    EmitRect(0f, 0f, 260f, 310f);
     il.Append(il.Create(OpCodes.Ldstr, "Fish Hunter Mod Menu"));
     il.Append(il.Create(OpCodes.Call, guiBox));
 
-    // Toggle rows
-    float ty = 50f;
+    // Toggle rows (dy relative to menu origin)
+    float ty = 30f;
     EmitToggle(ty, toggleFields["FreePurchases"], "Free Purchases"); ty += 30f;
     EmitToggle(ty, toggleFields["NoCurrencyDeduction"], "No Currency Loss"); ty += 30f;
     EmitToggle(ty, toggleFields["BoostCurrency"], "Boost Currency (999999)"); ty += 30f;
@@ -261,7 +283,7 @@ var controllerType = new TypeDefinition("", "ModMenuController",
     EmitToggle(ty, toggleFields["InventoryMultiplier"], "3x Inventory"); ty += 30f;
 
     // Footer label
-    EmitRect(30f, ty + 5f, 220f, 25f);
+    EmitRect(10f, ty + 10f, 240f, 25f);
     il.Append(il.Create(OpCodes.Ldstr, "F8 = Close  |  F9 = Dev Menu"));
     il.Append(il.Create(OpCodes.Call, guiLabel));
 
@@ -345,7 +367,18 @@ void PatchCheatMenu()
     tickMethod.Body.Instructions.Clear();
 
     var ret = il.Create(OpCodes.Ret);
-    il.Append(il.Create(OpCodes.Ldc_I4, 290)); // KeyCode.F9
+
+    // Bootstrap: one-time init of ModMenuController
+    var skipInit = il.Create(OpCodes.Ldc_I4, 290); // doubles as F9 keycode push
+    il.Append(il.Create(OpCodes.Ldsfld, initializedField));
+    il.Append(il.Create(OpCodes.Brtrue, skipInit));
+    il.Append(il.Create(OpCodes.Ldc_I4_1));
+    il.Append(il.Create(OpCodes.Stsfld, initializedField));
+    var initMethod = controllerType.Methods.First(m => m.Name == "Init");
+    il.Append(il.Create(OpCodes.Call, initMethod));
+
+    // F9 cheat menu check (skipInit lands here)
+    il.Append(skipInit); // Ldc_I4 290 = KeyCode.F9
     il.Append(il.Create(OpCodes.Call, getKeyDown));
     il.Append(il.Create(OpCodes.Brfalse, ret));
 
