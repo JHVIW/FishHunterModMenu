@@ -37,9 +37,8 @@ PatchMethodReturnTrue(currencyType, "CanSpend");
 Console.WriteLine("[*] Patch 3: No currency deduction (Spend bypass)...");
 PatchMethodReturnVoid(currencyType, "Spend");
 
-Console.WriteLine("[*] Patch 4: Infinite currency (TryGetCurrency + GetAmount)...");
-PatchTryGetCurrency(currencyType);
-PatchGetAmount(currencyType);
+Console.WriteLine("[*] Patch 4: Boost currency (Add always adds 999999 extra)...");
+PatchCurrencyAdd(currencyType);
 
 Console.WriteLine("[*] Patch 5: 10x inventory slot capacity...");
 PatchInventoryCapacity();
@@ -146,36 +145,22 @@ void PatchCheatMenu()
     }
 }
 
-void PatchTryGetCurrency(TypeDefinition? type)
+void PatchCurrencyAdd(TypeDefinition? type)
 {
-    // bool TryGetCurrency(Id currencyId, out int amount)
-    // Patch to: amount = 999999; return true;
-    var method = type?.Methods.FirstOrDefault(m => m.Name == "TryGetCurrency");
-    if (method == null) { Console.WriteLine("    [!] TryGetCurrency not found"); return; }
+    // Original Add(Id currencyId, int amount) adds `amount` to the dictionary.
+    // We patch it so arg2 (amount) is replaced with 999999 at the start,
+    // then the original method logic runs normally. This keeps the dictionary
+    // and event flow intact so the server doesn't break.
+    var method = type?.Methods.FirstOrDefault(m => m.Name == "Add");
+    if (method == null) { Console.WriteLine("    [!] Add not found"); return; }
 
     var il = method.Body.GetILProcessor();
-    method.Body.Instructions.Clear();
-    // arg0 = this, arg1 = currencyId, arg2 = out int amount (by ref)
-    il.Append(il.Create(OpCodes.Ldarg_2));          // load ref to 'amount'
-    il.Append(il.Create(OpCodes.Ldc_I4, 999999));   // push 999999
-    il.Append(il.Create(OpCodes.Stind_I4));          // *amount = 999999
-    il.Append(il.Create(OpCodes.Ldc_I4_1));          // return true
-    il.Append(il.Create(OpCodes.Ret));
+    var first = method.Body.Instructions[0];
+    // Overwrite the amount argument: arg2 = 999999
+    il.InsertBefore(first, il.Create(OpCodes.Ldc_I4, 999999));
+    il.InsertBefore(first, il.Create(OpCodes.Starg, method.Parameters[1]));
     patchCount++;
-    Console.WriteLine("    [OK] TryGetCurrency always outputs 999999");
-}
-
-void PatchGetAmount(TypeDefinition? type)
-{
-    var method = type?.Methods.FirstOrDefault(m => m.Name == "GetAmount");
-    if (method == null) { Console.WriteLine("    [!] GetAmount not found"); return; }
-
-    var il = method.Body.GetILProcessor();
-    method.Body.Instructions.Clear();
-    il.Append(il.Create(OpCodes.Ldc_I4, 999999));
-    il.Append(il.Create(OpCodes.Ret));
-    patchCount++;
-    Console.WriteLine("    [OK] GetAmount always returns 999999");
+    Console.WriteLine("    [OK] Add always adds 999999 regardless of input");
 }
 
 void PatchMethodReturnTrue(TypeDefinition? type, string methodName)
