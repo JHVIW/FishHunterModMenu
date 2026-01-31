@@ -37,7 +37,8 @@ PatchMethodReturnTrue(currencyType, "CanSpend");
 Console.WriteLine("[*] Patch 3: No currency deduction (Spend bypass)...");
 PatchMethodReturnVoid(currencyType, "Spend");
 
-Console.WriteLine("[*] Patch 4: Infinite currency (GetAmount returns 999999)...");
+Console.WriteLine("[*] Patch 4: Infinite currency (TryGetCurrency + GetAmount)...");
+PatchTryGetCurrency(currencyType);
 PatchGetAmount(currencyType);
 
 Console.WriteLine("[*] Patch 5: 10x inventory slot capacity...");
@@ -143,6 +144,25 @@ void PatchCheatMenu()
         patchCount++;
         Console.WriteLine("    [OK] OnHide re-locks cursor when cheat menu closes");
     }
+}
+
+void PatchTryGetCurrency(TypeDefinition? type)
+{
+    // bool TryGetCurrency(Id currencyId, out int amount)
+    // Patch to: amount = 999999; return true;
+    var method = type?.Methods.FirstOrDefault(m => m.Name == "TryGetCurrency");
+    if (method == null) { Console.WriteLine("    [!] TryGetCurrency not found"); return; }
+
+    var il = method.Body.GetILProcessor();
+    method.Body.Instructions.Clear();
+    // arg0 = this, arg1 = currencyId, arg2 = out int amount (by ref)
+    il.Append(il.Create(OpCodes.Ldarg_2));          // load ref to 'amount'
+    il.Append(il.Create(OpCodes.Ldc_I4, 999999));   // push 999999
+    il.Append(il.Create(OpCodes.Stind_I4));          // *amount = 999999
+    il.Append(il.Create(OpCodes.Ldc_I4_1));          // return true
+    il.Append(il.Create(OpCodes.Ret));
+    patchCount++;
+    Console.WriteLine("    [OK] TryGetCurrency always outputs 999999");
 }
 
 void PatchGetAmount(TypeDefinition? type)
