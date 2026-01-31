@@ -91,7 +91,7 @@ var configType = new TypeDefinition("", "ModMenuConfig",
 
 string[] toggleNames =
 {
-    "FreePurchases", "NoCurrencyDeduction", "BoostCurrency",
+    "FreePurchases", "BoostCurrency",
     "MaxLevel", "InfiniteAmmo", "NoAmmoCost", "InventoryMultiplier"
 };
 var toggleFields = new Dictionary<string, FieldDefinition>();
@@ -116,7 +116,9 @@ var cctor = new MethodDefinition(".cctor",
     module.TypeSystem.Void);
 {
     var il = cctor.Body.GetILProcessor();
-    // bools default to false already, just need ret
+    // Inventory must be ON by default (only applies at entity creation)
+    il.Append(il.Create(OpCodes.Ldc_I4_1));
+    il.Append(il.Create(OpCodes.Stsfld, toggleFields["InventoryMultiplier"]));
     il.Append(il.Create(OpCodes.Ret));
 }
 configType.Methods.Add(cctor);
@@ -234,9 +236,9 @@ var controllerType = new TypeDefinition("", "ModMenuController",
     il.Append(il.Create(OpCodes.Conv_R4));
     il.Append(il.Create(OpCodes.Stloc_0));
 
-    // oy = (Screen.height - 310) / 2
+    // oy = (Screen.height - 280) / 2
     il.Append(il.Create(OpCodes.Call, screenGetHeight));
-    il.Append(il.Create(OpCodes.Ldc_I4, 310));
+    il.Append(il.Create(OpCodes.Ldc_I4, 280));
     il.Append(il.Create(OpCodes.Sub));
     il.Append(il.Create(OpCodes.Ldc_I4_2));
     il.Append(il.Create(OpCodes.Div));
@@ -268,19 +270,18 @@ var controllerType = new TypeDefinition("", "ModMenuController",
     }
 
     // Background box
-    EmitRect(0f, 0f, 260f, 310f);
+    EmitRect(0f, 0f, 260f, 280f);
     il.Append(il.Create(OpCodes.Ldstr, "Fish Hunter Mod Menu"));
     il.Append(il.Create(OpCodes.Call, guiBox));
 
     // Toggle rows (dy relative to menu origin)
     float ty = 30f;
     EmitToggle(ty, toggleFields["FreePurchases"], "Free Purchases"); ty += 30f;
-    EmitToggle(ty, toggleFields["NoCurrencyDeduction"], "No Currency Loss"); ty += 30f;
     EmitToggle(ty, toggleFields["BoostCurrency"], "Boost Currency (999999)"); ty += 30f;
     EmitToggle(ty, toggleFields["MaxLevel"], "Max Level"); ty += 30f;
     EmitToggle(ty, toggleFields["InfiniteAmmo"], "Infinite Ammo"); ty += 30f;
     EmitToggle(ty, toggleFields["NoAmmoCost"], "No Ammo Cost"); ty += 30f;
-    EmitToggle(ty, toggleFields["InventoryMultiplier"], "3x Inventory"); ty += 30f;
+    EmitToggle(ty, toggleFields["InventoryMultiplier"], "3x Inventory (on load)"); ty += 30f;
 
     // Footer label
     EmitRect(10f, ty + 10f, 240f, 25f);
@@ -307,11 +308,9 @@ PatchCheatMenu();
 var currencyType = module.Types.FirstOrDefault(
     t => t.FullName == "AppRoot.Player.Currency.PlayerCurrencyProvider");
 
-Console.WriteLine("[*] Patch: Free purchases (conditional CanSpend)...");
-PatchConditionalReturnBool(currencyType, "CanSpend", toggleFields["FreePurchases"], true);
-
-Console.WriteLine("[*] Patch: No currency deduction (conditional Spend)...");
-PatchConditionalReturnVoid(currencyType, "Spend", toggleFields["NoCurrencyDeduction"]);
+Console.WriteLine("[*] Patch: Free purchases (conditional CanSpend + Spend)...");
+PatchAllOverloadsReturnBool(currencyType, "CanSpend", toggleFields["FreePurchases"], true);
+PatchAllOverloadsReturnVoid(currencyType, "Spend", toggleFields["FreePurchases"]);
 
 Console.WriteLine("[*] Patch: Boost currency (conditional Add)...");
 PatchConditionalCurrencyAdd(currencyType, toggleFields["BoostCurrency"]);
@@ -417,41 +416,45 @@ void PatchCheatMenu()
     }
 }
 
-/// Insert at method start: if (toggle) return <value>;
-void PatchConditionalReturnBool(TypeDefinition? type, string methodName,
+/// Patch ALL overloads of methodName to conditionally return a bool
+void PatchAllOverloadsReturnBool(TypeDefinition? type, string methodName,
     FieldDefinition toggleField, bool returnValue)
 {
-    var method = type?.Methods.FirstOrDefault(m => m.Name == methodName);
-    if (method == null) { Console.WriteLine($"    [!] {methodName} not found"); return; }
+    if (type == null) { Console.WriteLine($"    [!] Type not found for {methodName}"); return; }
+    var methods = type.Methods.Where(m => m.Name == methodName).ToList();
+    if (methods.Count == 0) { Console.WriteLine($"    [!] {methodName} not found"); return; }
 
-    var il = method.Body.GetILProcessor();
-    var originalFirst = method.Body.Instructions[0];
-
-    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldsfld, toggleField));
-    il.InsertBefore(originalFirst, il.Create(OpCodes.Brfalse, originalFirst));
-    il.InsertBefore(originalFirst, il.Create(returnValue ? OpCodes.Ldc_I4_1 : OpCodes.Ldc_I4_0));
-    il.InsertBefore(originalFirst, il.Create(OpCodes.Ret));
-
-    patchCount++;
-    Console.WriteLine($"    [OK] {methodName} conditionally returns {returnValue}");
+    foreach (var method in methods)
+    {
+        var il = method.Body.GetILProcessor();
+        var originalFirst = method.Body.Instructions[0];
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Ldsfld, toggleField));
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Brfalse, originalFirst));
+        il.InsertBefore(originalFirst, il.Create(returnValue ? OpCodes.Ldc_I4_1 : OpCodes.Ldc_I4_0));
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Ret));
+        patchCount++;
+    }
+    Console.WriteLine($"    [OK] {methodName} ({methods.Count} overload(s)) conditionally returns {returnValue}");
 }
 
-/// Insert at method start: if (toggle) return;
-void PatchConditionalReturnVoid(TypeDefinition? type, string methodName,
+/// Patch ALL overloads of methodName to conditionally return void
+void PatchAllOverloadsReturnVoid(TypeDefinition? type, string methodName,
     FieldDefinition toggleField)
 {
-    var method = type?.Methods.FirstOrDefault(m => m.Name == methodName);
-    if (method == null) { Console.WriteLine($"    [!] {methodName} not found"); return; }
+    if (type == null) { Console.WriteLine($"    [!] Type not found for {methodName}"); return; }
+    var methods = type.Methods.Where(m => m.Name == methodName).ToList();
+    if (methods.Count == 0) { Console.WriteLine($"    [!] {methodName} not found"); return; }
 
-    var il = method.Body.GetILProcessor();
-    var originalFirst = method.Body.Instructions[0];
-
-    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldsfld, toggleField));
-    il.InsertBefore(originalFirst, il.Create(OpCodes.Brfalse, originalFirst));
-    il.InsertBefore(originalFirst, il.Create(OpCodes.Ret));
-
-    patchCount++;
-    Console.WriteLine($"    [OK] {methodName} conditionally skipped");
+    foreach (var method in methods)
+    {
+        var il = method.Body.GetILProcessor();
+        var originalFirst = method.Body.Instructions[0];
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Ldsfld, toggleField));
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Brfalse, originalFirst));
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Ret));
+        patchCount++;
+    }
+    Console.WriteLine($"    [OK] {methodName} ({methods.Count} overload(s)) conditionally skipped");
 }
 
 /// Insert at method start: if (toggle) amount = 999999;

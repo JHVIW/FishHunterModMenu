@@ -10,13 +10,12 @@ Press **F8** in-game to open the mod menu (centered on screen). All cheats are *
 
 | Toggle | Description |
 |--------|-------------|
-| Free Purchases | `CanSpend()` always returns true. Buy anything regardless of balance. |
-| No Currency Loss | `Spend()` is skipped. Currency is never subtracted. |
+| Free Purchases | `CanSpend()` returns true and `Spend()` is skipped. Buy anything for free. |
 | Boost Currency (999999) | `Add()` always adds 999999 regardless of the original amount. |
 | Max Level | `GetLevelForExp()` returns the highest level in the config. |
 | Infinite Ammo | `GetBulletsCount()` always returns 999. |
 | No Ammo Cost | `CostBullets()` is skipped. Ammo is never consumed. |
-| 3x Inventory | `HandleCreateEntity()` multiplies all container capacities by 3. |
+| 3x Inventory | `HandleCreateEntity()` multiplies all container capacities by 3. Always on — applies at scene load. |
 
 Additionally, **F9** opens the hidden developer cheat menu with teleportation, fishing stage controls, and entity tools.
 
@@ -56,8 +55,8 @@ Or use Steam's "Verify integrity of game files" option.
 
 The patcher modifies IL bytecode in `Assembly-CSharp.dll` using Mono.Cecil. It injects two new types:
 
-- **ModMenuConfig** — static class with boolean toggle fields for each cheat, all defaulting to `true`
-- **ModMenuController** — a `MonoBehaviour` that auto-initializes via `[RuntimeInitializeOnLoadMethod]`, renders a Unity IMGUI menu on F8, and manages cursor lock/unlock
+- **ModMenuConfig** — static class with boolean toggle fields for each cheat (off by default, except 3x Inventory)
+- **ModMenuController** — a `MonoBehaviour` bootstrapped from `InputServerCheatMenu.Tick()`, renders a centered Unity IMGUI menu on F8 and manages cursor lock/unlock
 
 Each gameplay patch is **conditional**: a branch at the start of the target method checks the corresponding `ModMenuConfig` toggle. When enabled, the modded behavior runs. When disabled, the original game code executes normally.
 
