@@ -1,6 +1,6 @@
 # Fish Hunters Mod Menu
 
-DLL patcher for **Fish Hunters: Most Lethal Fishing Simulator** on Steam. Re-enables the hidden developer cheat menu, gives infinite currency, removes all purchase costs, and expands inventory capacity by 10x.
+DLL patcher for **Fish Hunters: Most Lethal Fishing Simulator** on Steam. Re-enables the hidden developer cheat menu, gives infinite currency, removes all purchase costs, and expands inventory capacity by 3x.
 
 Built for singleplayer use only. Fish Hunters is a Unity game using FishNet networking even in singleplayer (you host locally), so all patches target server-side logic that runs on your machine.
 
@@ -14,7 +14,7 @@ Patches the game's `Assembly-CSharp.dll` directly using Mono.Cecil. A backup is 
 | Infinite Currency | `PlayerCurrencyProvider.GetAmount()` always returns 999999. Your balance displays as 999999 everywhere. |
 | Free Purchases | `PlayerCurrencyProvider.CanSpend()` always returns `true`. Buy anything regardless of actual balance. |
 | No Currency Deduction | `PlayerCurrencyProvider.Spend()` is a no-op. Currency is never subtracted. |
-| 10x Inventory Capacity | `SlotContainerController.HandleCreateEntity()` multiplies all `ItemContainerConfig.Capacity` values by 10. Your 9 storage slots become 90. |
+| 3x Inventory Capacity | `SlotContainerController.HandleCreateEntity()` multiplies all `ItemContainerConfig.Capacity` values by 3. Your 9 storage slots become 27. |
 
 ## Requirements
 
@@ -56,7 +56,8 @@ Fish Hunters is built on Unity with FishNet for networking. Even in singleplayer
 - Replace `PlayerCurrencyProvider.GetAmount()` with `ldc.i4 999999; ret`
 - Replace `PlayerCurrencyProvider.CanSpend()` with `ldc.i4.1; ret` (always true)
 - Replace `PlayerCurrencyProvider.Spend()` with `ret` (no-op)
-- Insert `ldc.i4 10; mul` after `ldfld Capacity` in `SlotContainerController.HandleCreateEntity()`
+- Replace `PlayerCurrencyProvider.TryGetCurrency()` to always set `amount = 999999` and return `true`
+- Insert `ldc.i4.3; mul` after `ldfld Capacity` in `SlotContainerController.HandleCreateEntity()`
 
 ## Disclaimer
 

@@ -218,12 +218,12 @@ void PatchInventoryCapacity()
             && f.Name == "Capacity")
         {
             var il = method.Body.GetILProcessor();
-            var load10 = il.Create(OpCodes.Ldc_I4, 10);
+            var load3 = il.Create(OpCodes.Ldc_I4_3);
             var mul = il.Create(OpCodes.Mul);
-            il.InsertAfter(instructions[i], load10);
-            il.InsertAfter(load10, mul);
+            il.InsertAfter(instructions[i], load3);
+            il.InsertAfter(load3, mul);
             patchCount++;
-            Console.WriteLine("    [OK] All container capacities multiplied by 10");
+            Console.WriteLine("    [OK] All container capacities multiplied by 3");
             return;
         }
     }
