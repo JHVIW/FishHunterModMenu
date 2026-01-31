@@ -125,6 +125,24 @@ void PatchCheatMenu()
 
     patchCount++;
     Console.WriteLine("    [OK] F9 toggles cheat menu with cursor unlock");
+
+    // Patch CheatMenuScreen.OnHide to re-lock cursor when menu closes
+    var cheatMenuType = module.Types.FirstOrDefault(t => t.FullName == "CheatMenuScreen");
+    var onHide = cheatMenuType?.Methods.FirstOrDefault(m => m.Name == "OnHide");
+    if (onHide != null)
+    {
+        var hideIl = onHide.Body.GetILProcessor();
+        var firstInstr = onHide.Body.Instructions[0];
+
+        // Insert at the start: Cursor.lockState = Locked (1); Cursor.visible = false;
+        hideIl.InsertBefore(firstInstr, hideIl.Create(OpCodes.Ldc_I4_1)); // CursorLockMode.Locked
+        hideIl.InsertBefore(firstInstr, hideIl.Create(OpCodes.Call, module.ImportReference(setLockState)));
+        hideIl.InsertBefore(firstInstr, hideIl.Create(OpCodes.Ldc_I4_0)); // false
+        hideIl.InsertBefore(firstInstr, hideIl.Create(OpCodes.Call, module.ImportReference(setVisible)));
+
+        patchCount++;
+        Console.WriteLine("    [OK] OnHide re-locks cursor when cheat menu closes");
+    }
 }
 
 void PatchGetAmount(TypeDefinition? type)
