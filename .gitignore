@@ -1,0 +1,9 @@
+bin/
+obj/
+*.user
+*.suo
+.vs/
+__pycache__/
+*.pyc
+*.patched
+*.backup
