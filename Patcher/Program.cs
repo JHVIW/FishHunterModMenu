@@ -26,22 +26,21 @@ var module = assembly.MainModule;
 
 int patchCount = 0;
 
-// --- Patch 1: Re-enable developer cheat menu on F9 ---
-Console.WriteLine("\n[*] Patch 1: Developer cheat menu (F9)...");
+Console.WriteLine("\n[*] Patch 1: Developer cheat menu (F9 toggle + cursor unlock)...");
 PatchCheatMenu();
 
-// --- Patch 2: CanSpend always returns true ---
 Console.WriteLine("[*] Patch 2: Free purchases (CanSpend bypass)...");
 var currencyType = module.Types.FirstOrDefault(
     t => t.FullName == "AppRoot.Player.Currency.PlayerCurrencyProvider");
 PatchMethodReturnTrue(currencyType, "CanSpend");
 
-// --- Patch 3: Spend does nothing ---
 Console.WriteLine("[*] Patch 3: No currency deduction (Spend bypass)...");
 PatchMethodReturnVoid(currencyType, "Spend");
 
-// --- Patch 4: 10x inventory capacity ---
-Console.WriteLine("[*] Patch 4: 10x inventory slot capacity...");
+Console.WriteLine("[*] Patch 4: Infinite currency (GetAmount returns 999999)...");
+PatchGetAmount(currencyType);
+
+Console.WriteLine("[*] Patch 5: 10x inventory slot capacity...");
 PatchInventoryCapacity();
 
 if (patchCount > 0)
@@ -70,6 +69,7 @@ void PatchCheatMenu()
     var tickMethod = inputType?.Methods.FirstOrDefault(m => m.Name == "Tick");
     if (tickMethod == null) { Console.WriteLine("    [!] InputServerCheatMenu.Tick not found"); return; }
 
+    // Resolve Unity methods
     var unityInput = resolver.Resolve(
         AssemblyNameReference.Parse("UnityEngine.InputLegacyModule"));
     var getKeyDown = unityInput.MainModule.Types
@@ -77,25 +77,67 @@ void PatchCheatMenu()
         .Methods.First(m => m.Name == "GetKeyDown" && m.Parameters.Count == 1
             && m.Parameters[0].ParameterType.FullName == "UnityEngine.KeyCode");
 
+    var unityCoreModule = resolver.Resolve(
+        AssemblyNameReference.Parse("UnityEngine.CoreModule"));
+    var cursorType = unityCoreModule.MainModule.Types
+        .First(t => t.FullName == "UnityEngine.Cursor");
+    var setLockState = cursorType.Methods.First(m => m.Name == "set_lockState");
+    var setVisible = cursorType.Methods.First(m => m.Name == "set_visible");
+
     var uiManagerField = inputType!.Fields.First(f => f.Name == "_uiManager");
-    var openMethod = uiManagerField.FieldType.Resolve()!
-        .Methods.First(m => m.Name == "Open" && m.Parameters.Count == 1);
+    var uiManagerIface = uiManagerField.FieldType.Resolve()!;
+    var openMethod = uiManagerIface.Methods.First(m => m.Name == "Open" && m.Parameters.Count == 1);
+
+    var checkUiField = inputType.Fields.First(f => f.Name == "_checkUi");
+    var checkIface = checkUiField.FieldType.Resolve()!;
+    var isAnyOpen = checkIface.Methods.First(m => m.Name == "get_IsAnyDialogOpen");
 
     var il = tickMethod.Body.GetILProcessor();
     tickMethod.Body.Instructions.Clear();
 
+    // if (!Input.GetKeyDown(KeyCode.F9)) return;
     var ret = il.Create(OpCodes.Ret);
     il.Append(il.Create(OpCodes.Ldc_I4, 290)); // KeyCode.F9
     il.Append(il.Create(OpCodes.Call, module.ImportReference(getKeyDown)));
-    il.Append(il.Create(OpCodes.Brfalse_S, ret));
+    il.Append(il.Create(OpCodes.Brfalse, ret));
+
+    // Cursor.lockState = CursorLockMode.None (0)
+    il.Append(il.Create(OpCodes.Ldc_I4_0));
+    il.Append(il.Create(OpCodes.Call, module.ImportReference(setLockState)));
+
+    // Cursor.visible = true
+    il.Append(il.Create(OpCodes.Ldc_I4_1));
+    il.Append(il.Create(OpCodes.Call, module.ImportReference(setVisible)));
+
+    // if (_checkUi.IsAnyDialogOpen) return;  (don't stack menus)
+    il.Append(il.Create(OpCodes.Ldarg_0));
+    il.Append(il.Create(OpCodes.Ldfld, checkUiField));
+    il.Append(il.Create(OpCodes.Callvirt, module.ImportReference(isAnyOpen)));
+    il.Append(il.Create(OpCodes.Brtrue, ret));
+
+    // _uiManager.Open(UiElementType.ServerCheatMenu)
     il.Append(il.Create(OpCodes.Ldarg_0));
     il.Append(il.Create(OpCodes.Ldfld, uiManagerField));
-    il.Append(il.Create(OpCodes.Ldc_I4, 1001)); // UiElementType.ServerCheatMenu
+    il.Append(il.Create(OpCodes.Ldc_I4, 1001)); // ServerCheatMenu
     il.Append(il.Create(OpCodes.Callvirt, module.ImportReference(openMethod)));
+
     il.Append(ret);
 
     patchCount++;
-    Console.WriteLine("    [OK] Press F9 in-game to open cheat menu");
+    Console.WriteLine("    [OK] F9 toggles cheat menu with cursor unlock");
+}
+
+void PatchGetAmount(TypeDefinition? type)
+{
+    var method = type?.Methods.FirstOrDefault(m => m.Name == "GetAmount");
+    if (method == null) { Console.WriteLine("    [!] GetAmount not found"); return; }
+
+    var il = method.Body.GetILProcessor();
+    method.Body.Instructions.Clear();
+    il.Append(il.Create(OpCodes.Ldc_I4, 999999));
+    il.Append(il.Create(OpCodes.Ret));
+    patchCount++;
+    Console.WriteLine("    [OK] GetAmount always returns 999999");
 }
 
 void PatchMethodReturnTrue(TypeDefinition? type, string methodName)
@@ -159,7 +201,6 @@ string FindGameDirectory()
         @"E:\SteamLibrary\steamapps\common",
     ];
 
-    // Check for folder with the fish emoji name
     string[] folderNames = [
         "Fish Hunters \U0001F41F",
         "Fish Hunters",
@@ -175,7 +216,6 @@ string FindGameDirectory()
         }
     }
 
-    // Fallback: check if user passed a path as argument
     var args = Environment.GetCommandLineArgs();
     if (args.Length > 1 && Directory.Exists(args[1]))
         return args[1];
