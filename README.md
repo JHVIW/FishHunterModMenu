@@ -1,20 +1,24 @@
 # Fish Hunters Mod Menu
 
-DLL patcher for **Fish Hunters: Most Lethal Fishing Simulator** on Steam. Re-enables the hidden developer cheat menu, gives infinite currency, removes all purchase costs, and expands inventory capacity by 3x.
+DLL patcher for **Fish Hunters: Most Lethal Fishing Simulator** on Steam. Injects an in-game mod menu (F8) that lets you toggle all cheats live, plus re-enables the hidden developer cheat menu (F9).
 
 Built for singleplayer use only. Fish Hunters is a Unity game using FishNet networking even in singleplayer (you host locally), so all patches target server-side logic that runs on your machine.
 
 ## Features
 
-Patches the game's `Assembly-CSharp.dll` directly using Mono.Cecil. A backup is created automatically before any changes.
+Press **F8** in-game to open the mod menu. All toggles are enabled by default and can be switched on/off live.
 
-| Patch | Description |
-|-------|-------------|
-| Developer Cheat Menu | Re-enables the hidden `ServerCheatMenuDialog`. Press **F9** to open it with automatic cursor unlock. Includes teleportation, fishing stage controls, and entity tools. |
-| Infinite Currency | `PlayerCurrencyProvider.GetAmount()` always returns 999999. Your balance displays as 999999 everywhere. |
-| Free Purchases | `PlayerCurrencyProvider.CanSpend()` always returns `true`. Buy anything regardless of actual balance. |
-| No Currency Deduction | `PlayerCurrencyProvider.Spend()` is a no-op. Currency is never subtracted. |
-| 3x Inventory Capacity | `SlotContainerController.HandleCreateEntity()` multiplies all `ItemContainerConfig.Capacity` values by 3. Your 9 storage slots become 27. |
+| Toggle | Description |
+|--------|-------------|
+| Free Purchases | `CanSpend()` always returns true. Buy anything regardless of balance. |
+| No Currency Loss | `Spend()` is skipped. Currency is never subtracted. |
+| Boost Currency (999999) | `Add()` always adds 999999 regardless of the original amount. |
+| Max Level | `GetLevelForExp()` returns the highest level in the config. |
+| Infinite Ammo | `GetBulletsCount()` always returns 999. |
+| No Ammo Cost | `CostBullets()` is skipped. Ammo is never consumed. |
+| 3x Inventory | `HandleCreateEntity()` multiplies all container capacities by 3. |
+
+Additionally, **F9** opens the hidden developer cheat menu with teleportation, fishing stage controls, and entity tools.
 
 ## Requirements
 
@@ -35,7 +39,7 @@ The patcher auto-detects the game installation on common Steam library paths. If
 dotnet run -- "E:\SteamLibrary\steamapps\common\Fish Hunters\FishTmp_Data\Managed"
 ```
 
-Start the game normally after patching. Press **F9** to open the developer cheat menu.
+Start the game normally after patching. Press **F8** for the mod menu, **F9** for the dev cheat menu.
 
 ### Restoring the Original DLL
 
@@ -50,14 +54,14 @@ Or use Steam's "Verify integrity of game files" option.
 
 ## How It Works
 
-Fish Hunters is built on Unity with FishNet for networking. Even in singleplayer, the game runs a local server. The patcher modifies IL bytecode in `Assembly-CSharp.dll` using Mono.Cecil to:
+The patcher modifies IL bytecode in `Assembly-CSharp.dll` using Mono.Cecil. It injects two new types:
 
-- Inject `Input.GetKeyDown(KeyCode.F9)` into the previously empty `InputServerCheatMenu.Tick()` method, which calls `Cursor.lockState = None`, `Cursor.visible = true`, and `IUiManager.Open(ServerCheatMenu)` when pressed
-- Replace `PlayerCurrencyProvider.GetAmount()` with `ldc.i4 999999; ret`
-- Replace `PlayerCurrencyProvider.CanSpend()` with `ldc.i4.1; ret` (always true)
-- Replace `PlayerCurrencyProvider.Spend()` with `ret` (no-op)
-- Replace `PlayerCurrencyProvider.TryGetCurrency()` to always set `amount = 999999` and return `true`
-- Insert `ldc.i4.3; mul` after `ldfld Capacity` in `SlotContainerController.HandleCreateEntity()`
+- **ModMenuConfig** — static class with boolean toggle fields for each cheat, all defaulting to `true`
+- **ModMenuController** — a `MonoBehaviour` that auto-initializes via `[RuntimeInitializeOnLoadMethod]`, renders a Unity IMGUI menu on F8, and manages cursor lock/unlock
+
+Each gameplay patch is **conditional**: a branch at the start of the target method checks the corresponding `ModMenuConfig` toggle. When enabled, the modded behavior runs. When disabled, the original game code executes normally.
+
+The patcher always restores from backup before applying patches, so it's safe to re-run after changes.
 
 ## Disclaimer
 

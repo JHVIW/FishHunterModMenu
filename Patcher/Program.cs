@@ -1,6 +1,7 @@
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 
@@ -8,14 +9,16 @@ string gameDir = FindGameDirectory();
 string dllPath = Path.Combine(gameDir, "Assembly-CSharp.dll");
 string backupPath = dllPath + ".backup";
 
-if (!File.Exists(backupPath))
+// Always restore from backup before patching to avoid double-patching
+if (File.Exists(backupPath))
 {
-    File.Copy(dllPath, backupPath);
-    Console.WriteLine($"[+] Backup created: {backupPath}");
+    File.Copy(backupPath, dllPath, overwrite: true);
+    Console.WriteLine("[*] Restored clean DLL from backup.");
 }
 else
 {
-    Console.WriteLine("[*] Backup already exists, skipping.");
+    File.Copy(dllPath, backupPath);
+    Console.WriteLine("[+] Backup created: " + backupPath);
 }
 
 var resolver = new DefaultAssemblyResolver();
@@ -24,31 +27,285 @@ var assembly = AssemblyDefinition.ReadAssembly(dllPath,
     new ReaderParameters { AssemblyResolver = resolver });
 var module = assembly.MainModule;
 
+// ── Resolve Unity assemblies ──────────────────────────────────────────
+var unityCoreAsm = resolver.Resolve(AssemblyNameReference.Parse("UnityEngine.CoreModule"));
+var unityInputAsm = resolver.Resolve(AssemblyNameReference.Parse("UnityEngine.InputLegacyModule"));
+var unityImguiAsm = resolver.Resolve(AssemblyNameReference.Parse("UnityEngine.IMGUIModule"));
+
+var monoBehaviourDef = unityCoreAsm.MainModule.Types.First(t => t.FullName == "UnityEngine.MonoBehaviour");
+var gameObjectDef = unityCoreAsm.MainModule.Types.First(t => t.FullName == "UnityEngine.GameObject");
+var unityObjectDef = unityCoreAsm.MainModule.Types.First(t => t.FullName == "UnityEngine.Object");
+var rectDef = unityCoreAsm.MainModule.Types.First(t => t.FullName == "UnityEngine.Rect");
+var cursorDef = unityCoreAsm.MainModule.Types.First(t => t.FullName == "UnityEngine.Cursor");
+var inputDef = unityInputAsm.MainModule.Types.First(t => t.FullName == "UnityEngine.Input");
+var guiDef = unityImguiAsm.MainModule.Types.First(t => t.FullName == "UnityEngine.GUI");
+var runtimeInitAttrDef = unityCoreAsm.MainModule.Types.First(t => t.FullName == "UnityEngine.RuntimeInitializeOnLoadMethodAttribute");
+
+// Resolve methods we need
+var getKeyDown = module.ImportReference(inputDef.Methods.First(m =>
+    m.Name == "GetKeyDown" && m.Parameters.Count == 1
+    && m.Parameters[0].ParameterType.FullName == "UnityEngine.KeyCode"));
+var setLockState = module.ImportReference(cursorDef.Methods.First(m => m.Name == "set_lockState"));
+var setVisible = module.ImportReference(cursorDef.Methods.First(m => m.Name == "set_visible"));
+var rectCtor = module.ImportReference(rectDef.Methods.First(m =>
+    m.IsConstructor && m.Parameters.Count == 4));
+var guiBox = module.ImportReference(guiDef.Methods.First(m =>
+    m.Name == "Box" && m.Parameters.Count == 2
+    && m.Parameters[1].ParameterType.FullName == "System.String"));
+var guiToggle = module.ImportReference(guiDef.Methods.First(m =>
+    m.Name == "Toggle" && m.Parameters.Count == 3
+    && m.Parameters[2].ParameterType.FullName == "System.String"));
+var guiLabel = module.ImportReference(guiDef.Methods.First(m =>
+    m.Name == "Label" && m.Parameters.Count == 2
+    && m.Parameters[1].ParameterType.FullName == "System.String"));
+var goCtorString = module.ImportReference(gameObjectDef.Methods.First(m =>
+    m.IsConstructor && m.Parameters.Count == 1
+    && m.Parameters[0].ParameterType.FullName == "System.String"));
+var addComponentType = module.ImportReference(gameObjectDef.Methods.First(m =>
+    m.Name == "AddComponent" && m.Parameters.Count == 1
+    && m.Parameters[0].ParameterType.FullName == "System.Type"));
+var dontDestroyOnLoad = module.ImportReference(unityObjectDef.Methods.First(m =>
+    m.Name == "DontDestroyOnLoad"));
+var runtimeInitCtor = module.ImportReference(runtimeInitAttrDef.Methods.First(m =>
+    m.IsConstructor && m.Parameters.Count == 1));
+
+// Resolve System.Type.GetTypeFromHandle from corlib
+var corlib = module.TypeSystem.Object.Resolve().Module;
+var systemTypeDef = corlib.Types.First(t => t.FullName == "System.Type");
+var getTypeFromHandle = module.ImportReference(systemTypeDef.Methods.First(m =>
+    m.Name == "GetTypeFromHandle"));
+
 int patchCount = 0;
 
-Console.WriteLine("\n[*] Patch 1: Developer cheat menu (F9 toggle + cursor unlock)...");
+// ══════════════════════════════════════════════════════════════════════
+// STEP 1: Inject ModMenuConfig (static class with toggle fields)
+// ══════════════════════════════════════════════════════════════════════
+Console.WriteLine("\n[*] Injecting ModMenuConfig...");
+
+var configType = new TypeDefinition("", "ModMenuConfig",
+    TypeAttributes.Public | TypeAttributes.Abstract | TypeAttributes.Sealed | TypeAttributes.BeforeFieldInit,
+    module.TypeSystem.Object);
+
+string[] toggleNames =
+{
+    "FreePurchases", "NoCurrencyDeduction", "BoostCurrency",
+    "MaxLevel", "InfiniteAmmo", "NoAmmoCost", "InventoryMultiplier"
+};
+var toggleFields = new Dictionary<string, FieldDefinition>();
+foreach (var name in toggleNames)
+{
+    var f = new FieldDefinition(name,
+        FieldAttributes.Public | FieldAttributes.Static, module.TypeSystem.Boolean);
+    configType.Fields.Add(f);
+    toggleFields[name] = f;
+}
+var menuOpenField = new FieldDefinition("MenuOpen",
+    FieldAttributes.Public | FieldAttributes.Static, module.TypeSystem.Boolean);
+configType.Fields.Add(menuOpenField);
+
+// Static constructor: set all toggles to true
+var cctor = new MethodDefinition(".cctor",
+    MethodAttributes.Static | MethodAttributes.Private |
+    MethodAttributes.SpecialName | MethodAttributes.RTSpecialName | MethodAttributes.HideBySig,
+    module.TypeSystem.Void);
+{
+    var il = cctor.Body.GetILProcessor();
+    foreach (var f in toggleFields.Values)
+    {
+        il.Append(il.Create(OpCodes.Ldc_I4_1));
+        il.Append(il.Create(OpCodes.Stsfld, f));
+    }
+    il.Append(il.Create(OpCodes.Ret));
+}
+configType.Methods.Add(cctor);
+module.Types.Add(configType);
+Console.WriteLine("    [OK] ModMenuConfig injected with 7 toggles");
+
+// ══════════════════════════════════════════════════════════════════════
+// STEP 2: Inject ModMenuController : MonoBehaviour
+// ══════════════════════════════════════════════════════════════════════
+Console.WriteLine("[*] Injecting ModMenuController...");
+
+var controllerType = new TypeDefinition("", "ModMenuController",
+    TypeAttributes.Public | TypeAttributes.BeforeFieldInit,
+    module.ImportReference(monoBehaviourDef));
+
+// Constructor: call base MonoBehaviour()
+{
+    var ctor = new MethodDefinition(".ctor",
+        MethodAttributes.Public | MethodAttributes.SpecialName |
+        MethodAttributes.RTSpecialName | MethodAttributes.HideBySig,
+        module.TypeSystem.Void);
+    var il = ctor.Body.GetILProcessor();
+    il.Append(il.Create(OpCodes.Ldarg_0));
+    il.Append(il.Create(OpCodes.Call, module.ImportReference(
+        monoBehaviourDef.Methods.First(m => m.IsConstructor && m.Parameters.Count == 0))));
+    il.Append(il.Create(OpCodes.Ret));
+    controllerType.Methods.Add(ctor);
+}
+
+// Static Init() with [RuntimeInitializeOnLoadMethod(AfterSceneLoad)]
+{
+    var init = new MethodDefinition("Init",
+        MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig,
+        module.TypeSystem.Void);
+    var il = init.Body.GetILProcessor();
+    // var go = new GameObject("FishHunterModMenu");
+    il.Append(il.Create(OpCodes.Ldstr, "FishHunterModMenu"));
+    il.Append(il.Create(OpCodes.Newobj, goCtorString));
+    il.Append(il.Create(OpCodes.Dup));
+    // go.AddComponent(typeof(ModMenuController));
+    il.Append(il.Create(OpCodes.Ldtoken, controllerType));
+    il.Append(il.Create(OpCodes.Call, getTypeFromHandle));
+    il.Append(il.Create(OpCodes.Callvirt, addComponentType));
+    il.Append(il.Create(OpCodes.Pop));
+    // DontDestroyOnLoad(go);
+    il.Append(il.Create(OpCodes.Call, dontDestroyOnLoad));
+    il.Append(il.Create(OpCodes.Ret));
+
+    var attr = new CustomAttribute(runtimeInitCtor);
+    attr.ConstructorArguments.Add(new CustomAttributeArgument(
+        module.ImportReference(runtimeInitAttrDef.Methods.First(m =>
+            m.IsConstructor && m.Parameters.Count == 1).Parameters[0].ParameterType),
+        1)); // RuntimeInitializeLoadType.AfterSceneLoad
+    init.CustomAttributes.Add(attr);
+    controllerType.Methods.Add(init);
+}
+
+// Update() — F8 toggles menu + cursor
+{
+    var update = new MethodDefinition("Update",
+        MethodAttributes.Private | MethodAttributes.HideBySig,
+        module.TypeSystem.Void);
+    var il = update.Body.GetILProcessor();
+    var ret = il.Create(OpCodes.Ret);
+
+    // if (!Input.GetKeyDown(KeyCode.F8)) return;   (F8 = 289)
+    il.Append(il.Create(OpCodes.Ldc_I4, 289));
+    il.Append(il.Create(OpCodes.Call, getKeyDown));
+    il.Append(il.Create(OpCodes.Brfalse, ret));
+
+    // MenuOpen = !MenuOpen
+    il.Append(il.Create(OpCodes.Ldsfld, menuOpenField));
+    il.Append(il.Create(OpCodes.Ldc_I4_0));
+    il.Append(il.Create(OpCodes.Ceq));
+    il.Append(il.Create(OpCodes.Stsfld, menuOpenField));
+
+    // if (MenuOpen) unlock else lock cursor
+    var lockLabel = il.Create(OpCodes.Ldc_I4_1);
+    il.Append(il.Create(OpCodes.Ldsfld, menuOpenField));
+    il.Append(il.Create(OpCodes.Brfalse, lockLabel));
+
+    // Unlock cursor
+    il.Append(il.Create(OpCodes.Ldc_I4_0));
+    il.Append(il.Create(OpCodes.Call, setLockState));
+    il.Append(il.Create(OpCodes.Ldc_I4_1));
+    il.Append(il.Create(OpCodes.Call, setVisible));
+    il.Append(il.Create(OpCodes.Br, ret));
+
+    // Lock cursor
+    il.Append(lockLabel); // Ldc_I4_1
+    il.Append(il.Create(OpCodes.Call, setLockState));
+    il.Append(il.Create(OpCodes.Ldc_I4_0));
+    il.Append(il.Create(OpCodes.Call, setVisible));
+
+    il.Append(ret);
+    controllerType.Methods.Add(update);
+}
+
+// OnGUI() — draw mod menu
+{
+    var onGui = new MethodDefinition("OnGUI",
+        MethodAttributes.Private | MethodAttributes.HideBySig,
+        module.TypeSystem.Void);
+    var il = onGui.Body.GetILProcessor();
+    var ret = il.Create(OpCodes.Ret);
+
+    // if (!MenuOpen) return;
+    il.Append(il.Create(OpCodes.Ldsfld, menuOpenField));
+    il.Append(il.Create(OpCodes.Brfalse, ret));
+
+    // Helper: emit new Rect(x,y,w,h)
+    void EmitRect(float x, float y, float w, float h)
+    {
+        il.Append(il.Create(OpCodes.Ldc_R4, x));
+        il.Append(il.Create(OpCodes.Ldc_R4, y));
+        il.Append(il.Create(OpCodes.Ldc_R4, w));
+        il.Append(il.Create(OpCodes.Ldc_R4, h));
+        il.Append(il.Create(OpCodes.Newobj, rectCtor));
+    }
+
+    // Helper: emit a toggle row
+    void EmitToggle(float y, FieldDefinition field, string label)
+    {
+        EmitRect(30f, y, 220f, 25f);
+        il.Append(il.Create(OpCodes.Ldsfld, field));
+        il.Append(il.Create(OpCodes.Ldstr, label));
+        il.Append(il.Create(OpCodes.Call, guiToggle));
+        il.Append(il.Create(OpCodes.Stsfld, field));
+    }
+
+    // Background box
+    EmitRect(20f, 20f, 260f, 310f);
+    il.Append(il.Create(OpCodes.Ldstr, "Fish Hunter Mod Menu"));
+    il.Append(il.Create(OpCodes.Call, guiBox));
+
+    // Toggle rows
+    float ty = 50f;
+    EmitToggle(ty, toggleFields["FreePurchases"], "Free Purchases"); ty += 30f;
+    EmitToggle(ty, toggleFields["NoCurrencyDeduction"], "No Currency Loss"); ty += 30f;
+    EmitToggle(ty, toggleFields["BoostCurrency"], "Boost Currency (999999)"); ty += 30f;
+    EmitToggle(ty, toggleFields["MaxLevel"], "Max Level"); ty += 30f;
+    EmitToggle(ty, toggleFields["InfiniteAmmo"], "Infinite Ammo"); ty += 30f;
+    EmitToggle(ty, toggleFields["NoAmmoCost"], "No Ammo Cost"); ty += 30f;
+    EmitToggle(ty, toggleFields["InventoryMultiplier"], "3x Inventory"); ty += 30f;
+
+    // Footer label
+    EmitRect(30f, ty + 5f, 220f, 25f);
+    il.Append(il.Create(OpCodes.Ldstr, "F8 = Close  |  F9 = Dev Menu"));
+    il.Append(il.Create(OpCodes.Call, guiLabel));
+
+    il.Append(ret);
+    controllerType.Methods.Add(onGui);
+}
+
+module.Types.Add(controllerType);
+patchCount++;
+Console.WriteLine("    [OK] ModMenuController injected (F8 toggle, IMGUI menu)");
+
+// ══════════════════════════════════════════════════════════════════════
+// STEP 3: Patch F9 developer cheat menu (same as before)
+// ══════════════════════════════════════════════════════════════════════
+Console.WriteLine("[*] Patch: Developer cheat menu (F9 toggle)...");
 PatchCheatMenu();
 
-Console.WriteLine("[*] Patch 2: Free purchases (CanSpend bypass)...");
+// ══════════════════════════════════════════════════════════════════════
+// STEP 4: Conditional gameplay patches
+// ══════════════════════════════════════════════════════════════════════
 var currencyType = module.Types.FirstOrDefault(
     t => t.FullName == "AppRoot.Player.Currency.PlayerCurrencyProvider");
-PatchMethodReturnTrue(currencyType, "CanSpend");
 
-Console.WriteLine("[*] Patch 3: No currency deduction (Spend bypass)...");
-PatchMethodReturnVoid(currencyType, "Spend");
+Console.WriteLine("[*] Patch: Free purchases (conditional CanSpend)...");
+PatchConditionalReturnBool(currencyType, "CanSpend", toggleFields["FreePurchases"], true);
 
-Console.WriteLine("[*] Patch 4: Boost currency (Add always adds 999999 extra)...");
-PatchCurrencyAdd(currencyType);
+Console.WriteLine("[*] Patch: No currency deduction (conditional Spend)...");
+PatchConditionalReturnVoid(currencyType, "Spend", toggleFields["NoCurrencyDeduction"]);
 
-Console.WriteLine("[*] Patch 5: Max level (GetLevelForExp returns last level)...");
-PatchMaxLevel();
+Console.WriteLine("[*] Patch: Boost currency (conditional Add)...");
+PatchConditionalCurrencyAdd(currencyType, toggleFields["BoostCurrency"]);
 
-Console.WriteLine("[*] Patch 6: Infinite ammo...");
-PatchInfiniteAmmo();
+Console.WriteLine("[*] Patch: Max level (conditional GetLevelForExp)...");
+PatchConditionalMaxLevel(toggleFields["MaxLevel"]);
 
-Console.WriteLine("[*] Patch 7: 3x inventory slot capacity...");
-PatchInventoryCapacity();
+Console.WriteLine("[*] Patch: Infinite ammo (conditional GetBulletsCount)...");
+PatchConditionalInfiniteAmmo(toggleFields["InfiniteAmmo"], toggleFields["NoAmmoCost"]);
 
+Console.WriteLine("[*] Patch: 3x inventory capacity (conditional)...");
+PatchConditionalInventoryCapacity(toggleFields["InventoryMultiplier"]);
+
+// ══════════════════════════════════════════════════════════════════════
+// Save
+// ══════════════════════════════════════════════════════════════════════
 if (patchCount > 0)
 {
     string patchedPath = dllPath + ".patched";
@@ -57,7 +314,7 @@ if (patchCount > 0)
     File.Delete(dllPath);
     File.Move(patchedPath, dllPath);
     Console.WriteLine($"\n[+] Done. {patchCount} patches applied.");
-    Console.WriteLine("[+] Restart the game for changes to take effect.");
+    Console.WriteLine("[+] In-game: press F8 for mod menu, F9 for dev cheat menu.");
     Console.WriteLine("[*] To restore: rename Assembly-CSharp.dll.backup to Assembly-CSharp.dll");
 }
 else
@@ -66,199 +323,194 @@ else
     Console.WriteLine("\n[!] No patches applied.");
 }
 
-// -------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════
+// Patch methods
+// ═══════════════════════════════════════════════════════════════════════
 
 void PatchCheatMenu()
 {
-    var inputType = module.Types.FirstOrDefault(
+    var inputType2 = module.Types.FirstOrDefault(
         t => t.FullName == "Ui.UiRoots.InputServerCheatMenu");
-    var tickMethod = inputType?.Methods.FirstOrDefault(m => m.Name == "Tick");
+    var tickMethod = inputType2?.Methods.FirstOrDefault(m => m.Name == "Tick");
     if (tickMethod == null) { Console.WriteLine("    [!] InputServerCheatMenu.Tick not found"); return; }
 
-    // Resolve Unity methods
-    var unityInput = resolver.Resolve(
-        AssemblyNameReference.Parse("UnityEngine.InputLegacyModule"));
-    var getKeyDown = unityInput.MainModule.Types
-        .First(t => t.FullName == "UnityEngine.Input")
-        .Methods.First(m => m.Name == "GetKeyDown" && m.Parameters.Count == 1
-            && m.Parameters[0].ParameterType.FullName == "UnityEngine.KeyCode");
-
-    var unityCoreModule = resolver.Resolve(
-        AssemblyNameReference.Parse("UnityEngine.CoreModule"));
-    var cursorType = unityCoreModule.MainModule.Types
-        .First(t => t.FullName == "UnityEngine.Cursor");
-    var setLockState = cursorType.Methods.First(m => m.Name == "set_lockState");
-    var setVisible = cursorType.Methods.First(m => m.Name == "set_visible");
-
-    var uiManagerField = inputType!.Fields.First(f => f.Name == "_uiManager");
+    var uiManagerField = inputType2!.Fields.First(f => f.Name == "_uiManager");
     var uiManagerIface = uiManagerField.FieldType.Resolve()!;
     var openMethod = uiManagerIface.Methods.First(m => m.Name == "Open" && m.Parameters.Count == 1);
-
-    var checkUiField = inputType.Fields.First(f => f.Name == "_checkUi");
+    var checkUiField = inputType2.Fields.First(f => f.Name == "_checkUi");
     var checkIface = checkUiField.FieldType.Resolve()!;
     var isAnyOpen = checkIface.Methods.First(m => m.Name == "get_IsAnyDialogOpen");
 
     var il = tickMethod.Body.GetILProcessor();
     tickMethod.Body.Instructions.Clear();
 
-    // if (!Input.GetKeyDown(KeyCode.F9)) return;
     var ret = il.Create(OpCodes.Ret);
     il.Append(il.Create(OpCodes.Ldc_I4, 290)); // KeyCode.F9
-    il.Append(il.Create(OpCodes.Call, module.ImportReference(getKeyDown)));
+    il.Append(il.Create(OpCodes.Call, getKeyDown));
     il.Append(il.Create(OpCodes.Brfalse, ret));
 
-    // Cursor.lockState = CursorLockMode.None (0)
     il.Append(il.Create(OpCodes.Ldc_I4_0));
-    il.Append(il.Create(OpCodes.Call, module.ImportReference(setLockState)));
-
-    // Cursor.visible = true
+    il.Append(il.Create(OpCodes.Call, setLockState));
     il.Append(il.Create(OpCodes.Ldc_I4_1));
-    il.Append(il.Create(OpCodes.Call, module.ImportReference(setVisible)));
+    il.Append(il.Create(OpCodes.Call, setVisible));
 
-    // if (_checkUi.IsAnyDialogOpen) return;  (don't stack menus)
     il.Append(il.Create(OpCodes.Ldarg_0));
     il.Append(il.Create(OpCodes.Ldfld, checkUiField));
     il.Append(il.Create(OpCodes.Callvirt, module.ImportReference(isAnyOpen)));
     il.Append(il.Create(OpCodes.Brtrue, ret));
 
-    // _uiManager.Open(UiElementType.ServerCheatMenu)
     il.Append(il.Create(OpCodes.Ldarg_0));
     il.Append(il.Create(OpCodes.Ldfld, uiManagerField));
-    il.Append(il.Create(OpCodes.Ldc_I4, 1001)); // ServerCheatMenu
+    il.Append(il.Create(OpCodes.Ldc_I4, 1001));
     il.Append(il.Create(OpCodes.Callvirt, module.ImportReference(openMethod)));
-
     il.Append(ret);
 
     patchCount++;
     Console.WriteLine("    [OK] F9 toggles cheat menu with cursor unlock");
 
-    // Patch CheatMenuScreen.OnHide to re-lock cursor when menu closes
+    // Patch OnHide to re-lock cursor
     var cheatMenuType = module.Types.FirstOrDefault(t => t.FullName == "CheatMenuScreen");
     var onHide = cheatMenuType?.Methods.FirstOrDefault(m => m.Name == "OnHide");
     if (onHide != null)
     {
         var hideIl = onHide.Body.GetILProcessor();
-        var firstInstr = onHide.Body.Instructions[0];
-
-        // Insert at the start: Cursor.lockState = Locked (1); Cursor.visible = false;
-        hideIl.InsertBefore(firstInstr, hideIl.Create(OpCodes.Ldc_I4_1)); // CursorLockMode.Locked
-        hideIl.InsertBefore(firstInstr, hideIl.Create(OpCodes.Call, module.ImportReference(setLockState)));
-        hideIl.InsertBefore(firstInstr, hideIl.Create(OpCodes.Ldc_I4_0)); // false
-        hideIl.InsertBefore(firstInstr, hideIl.Create(OpCodes.Call, module.ImportReference(setVisible)));
-
+        var first = onHide.Body.Instructions[0];
+        hideIl.InsertBefore(first, hideIl.Create(OpCodes.Ldc_I4_1));
+        hideIl.InsertBefore(first, hideIl.Create(OpCodes.Call, setLockState));
+        hideIl.InsertBefore(first, hideIl.Create(OpCodes.Ldc_I4_0));
+        hideIl.InsertBefore(first, hideIl.Create(OpCodes.Call, setVisible));
         patchCount++;
-        Console.WriteLine("    [OK] OnHide re-locks cursor when cheat menu closes");
+        Console.WriteLine("    [OK] OnHide re-locks cursor");
     }
 }
 
-void PatchCurrencyAdd(TypeDefinition? type)
+/// Insert at method start: if (toggle) return <value>;
+void PatchConditionalReturnBool(TypeDefinition? type, string methodName,
+    FieldDefinition toggleField, bool returnValue)
 {
-    // Original Add(Id currencyId, int amount) adds `amount` to the dictionary.
-    // We patch it so arg2 (amount) is replaced with 999999 at the start,
-    // then the original method logic runs normally. This keeps the dictionary
-    // and event flow intact so the server doesn't break.
+    var method = type?.Methods.FirstOrDefault(m => m.Name == methodName);
+    if (method == null) { Console.WriteLine($"    [!] {methodName} not found"); return; }
+
+    var il = method.Body.GetILProcessor();
+    var originalFirst = method.Body.Instructions[0];
+
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldsfld, toggleField));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Brfalse, originalFirst));
+    il.InsertBefore(originalFirst, il.Create(returnValue ? OpCodes.Ldc_I4_1 : OpCodes.Ldc_I4_0));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ret));
+
+    patchCount++;
+    Console.WriteLine($"    [OK] {methodName} conditionally returns {returnValue}");
+}
+
+/// Insert at method start: if (toggle) return;
+void PatchConditionalReturnVoid(TypeDefinition? type, string methodName,
+    FieldDefinition toggleField)
+{
+    var method = type?.Methods.FirstOrDefault(m => m.Name == methodName);
+    if (method == null) { Console.WriteLine($"    [!] {methodName} not found"); return; }
+
+    var il = method.Body.GetILProcessor();
+    var originalFirst = method.Body.Instructions[0];
+
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldsfld, toggleField));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Brfalse, originalFirst));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ret));
+
+    patchCount++;
+    Console.WriteLine($"    [OK] {methodName} conditionally skipped");
+}
+
+/// Insert at method start: if (toggle) amount = 999999;
+void PatchConditionalCurrencyAdd(TypeDefinition? type, FieldDefinition toggleField)
+{
     var method = type?.Methods.FirstOrDefault(m => m.Name == "Add");
     if (method == null) { Console.WriteLine("    [!] Add not found"); return; }
 
     var il = method.Body.GetILProcessor();
-    var first = method.Body.Instructions[0];
-    // Overwrite the amount argument: arg2 = 999999
-    il.InsertBefore(first, il.Create(OpCodes.Ldc_I4, 999999));
-    il.InsertBefore(first, il.Create(OpCodes.Starg, method.Parameters[1]));
+    var originalFirst = method.Body.Instructions[0];
+
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldsfld, toggleField));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Brfalse, originalFirst));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldc_I4, 999999));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Starg, method.Parameters[1]));
+
     patchCount++;
-    Console.WriteLine("    [OK] Add always adds 999999 regardless of input");
+    Console.WriteLine("    [OK] Add conditionally boosts to 999999");
 }
 
-void PatchInfiniteAmmo()
+/// Insert at method start: if (toggle) return _expToLevel[last].Level;
+void PatchConditionalMaxLevel(FieldDefinition toggleField)
 {
-    var bulletsType = module.Types.FirstOrDefault(
-        t => t.FullName == "Features.Shooting.MyBulletsInventory");
-    if (bulletsType == null) { Console.WriteLine("    [!] MyBulletsInventory not found"); return; }
-
-    // GetBulletsCount(Id) -> always return 999
-    var getCount = bulletsType.Methods.FirstOrDefault(
-        m => m.Name == "GetBulletsCount" && m.Parameters.Count == 1);
-    if (getCount != null)
-    {
-        var il = getCount.Body.GetILProcessor();
-        getCount.Body.Instructions.Clear();
-        il.Append(il.Create(OpCodes.Ldc_I4, 999));
-        il.Append(il.Create(OpCodes.Ret));
-        patchCount++;
-        Console.WriteLine("    [OK] GetBulletsCount always returns 999");
-    }
-
-    // CostBullets -> no-op (never consume ammo)
-    var cost = bulletsType.Methods.FirstOrDefault(m => m.Name == "CostBullets");
-    if (cost != null)
-    {
-        var il = cost.Body.GetILProcessor();
-        cost.Body.Instructions.Clear();
-        il.Append(il.Create(OpCodes.Ret));
-        patchCount++;
-        Console.WriteLine("    [OK] CostBullets is now a no-op");
-    }
-}
-
-void PatchMaxLevel()
-{
-    // LevelsConfig.GetLevelForExp reads _expToLevel array and returns a level.
-    // Patch to: return _expToLevel[_expToLevel.Length - 1].Level  (always max level)
     var type = module.Types.FirstOrDefault(t => t.FullName == "Features.Levels.LevelsConfig");
     var method = type?.Methods.FirstOrDefault(m => m.Name == "GetLevelForExp");
     if (method == null) { Console.WriteLine("    [!] GetLevelForExp not found"); return; }
 
-    // Find the _expToLevel field and the Level field on ExpToLevelConfig
     var expToLevelField = type!.Fields.FirstOrDefault(f => f.Name == "_expToLevel");
     var elemType = expToLevelField!.FieldType.GetElementType().Resolve();
     var levelField = elemType.Fields.FirstOrDefault(f => f.Name == "Level");
 
     var il = method.Body.GetILProcessor();
-    method.Body.Instructions.Clear();
+    var originalFirst = method.Body.Instructions[0];
 
-    // return this._expToLevel[this._expToLevel.Length - 1].Level
-    il.Append(il.Create(OpCodes.Ldarg_0));                          // this
-    il.Append(il.Create(OpCodes.Ldfld, expToLevelField));           // _expToLevel
-    il.Append(il.Create(OpCodes.Ldarg_0));                          // this
-    il.Append(il.Create(OpCodes.Ldfld, expToLevelField));           // _expToLevel
-    il.Append(il.Create(OpCodes.Ldlen));                            // .Length
-    il.Append(il.Create(OpCodes.Conv_I4));                          // convert to int
-    il.Append(il.Create(OpCodes.Ldc_I4_1));                         // 1
-    il.Append(il.Create(OpCodes.Sub));                              // Length - 1
-    il.Append(il.Create(OpCodes.Ldelem_Ref));                       // _expToLevel[Length-1]
-    il.Append(il.Create(OpCodes.Ldfld, module.ImportReference(levelField)));  // .Level
-    il.Append(il.Create(OpCodes.Ret));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldsfld, toggleField));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Brfalse, originalFirst));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldarg_0));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldfld, expToLevelField));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldarg_0));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldfld, expToLevelField));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldlen));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Conv_I4));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldc_I4_1));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Sub));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldelem_Ref));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ldfld, module.ImportReference(levelField)));
+    il.InsertBefore(originalFirst, il.Create(OpCodes.Ret));
 
     patchCount++;
-    Console.WriteLine("    [OK] GetLevelForExp always returns max level");
+    Console.WriteLine("    [OK] GetLevelForExp conditionally returns max level");
 }
 
-void PatchMethodReturnTrue(TypeDefinition? type, string methodName)
+void PatchConditionalInfiniteAmmo(FieldDefinition ammoToggle, FieldDefinition costToggle)
 {
-    var method = type?.Methods.FirstOrDefault(m => m.Name == methodName);
-    if (method == null) { Console.WriteLine($"    [!] {methodName} not found"); return; }
+    var bulletsType = module.Types.FirstOrDefault(
+        t => t.FullName == "Features.Shooting.MyBulletsInventory");
+    if (bulletsType == null) { Console.WriteLine("    [!] MyBulletsInventory not found"); return; }
 
-    var il = method.Body.GetILProcessor();
-    method.Body.Instructions.Clear();
-    il.Append(il.Create(OpCodes.Ldc_I4_1));
-    il.Append(il.Create(OpCodes.Ret));
-    patchCount++;
-    Console.WriteLine($"    [OK] {methodName} now always returns true");
+    // GetBulletsCount: if (toggle) return 999;
+    var getCount = bulletsType.Methods.FirstOrDefault(
+        m => m.Name == "GetBulletsCount" && m.Parameters.Count == 1);
+    if (getCount != null)
+    {
+        var il = getCount.Body.GetILProcessor();
+        var originalFirst = getCount.Body.Instructions[0];
+
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Ldsfld, ammoToggle));
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Brfalse, originalFirst));
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Ldc_I4, 999));
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Ret));
+
+        patchCount++;
+        Console.WriteLine("    [OK] GetBulletsCount conditionally returns 999");
+    }
+
+    // CostBullets: if (toggle) return;
+    var cost = bulletsType.Methods.FirstOrDefault(m => m.Name == "CostBullets");
+    if (cost != null)
+    {
+        var il = cost.Body.GetILProcessor();
+        var originalFirst = cost.Body.Instructions[0];
+
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Ldsfld, costToggle));
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Brfalse, originalFirst));
+        il.InsertBefore(originalFirst, il.Create(OpCodes.Ret));
+
+        patchCount++;
+        Console.WriteLine("    [OK] CostBullets conditionally skipped");
+    }
 }
 
-void PatchMethodReturnVoid(TypeDefinition? type, string methodName)
-{
-    var method = type?.Methods.FirstOrDefault(m => m.Name == methodName);
-    if (method == null) { Console.WriteLine($"    [!] {methodName} not found"); return; }
-
-    var il = method.Body.GetILProcessor();
-    method.Body.Instructions.Clear();
-    il.Append(il.Create(OpCodes.Ret));
-    patchCount++;
-    Console.WriteLine($"    [OK] {methodName} is now a no-op");
-}
-
-void PatchInventoryCapacity()
+void PatchConditionalInventoryCapacity(FieldDefinition toggleField)
 {
     var type = module.Types.FirstOrDefault(
         t => t.FullName == "Features.SlotsContainer.SlotContainerController");
@@ -273,12 +525,19 @@ void PatchInventoryCapacity()
             && f.Name == "Capacity")
         {
             var il = method.Body.GetILProcessor();
+            var next = instructions[i + 1]; // instruction after Ldfld Capacity
+
+            // Insert: if (toggle) { ldc.i4.3; mul; }
             var load3 = il.Create(OpCodes.Ldc_I4_3);
             var mul = il.Create(OpCodes.Mul);
-            il.InsertAfter(instructions[i], load3);
-            il.InsertAfter(load3, mul);
+
+            il.InsertBefore(next, il.Create(OpCodes.Ldsfld, toggleField));
+            il.InsertBefore(next, il.Create(OpCodes.Brfalse, next));
+            il.InsertBefore(next, load3);
+            il.InsertBefore(next, mul);
+
             patchCount++;
-            Console.WriteLine("    [OK] All container capacities multiplied by 3");
+            Console.WriteLine("    [OK] Capacity conditionally multiplied by 3");
             return;
         }
     }
