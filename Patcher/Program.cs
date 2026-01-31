@@ -40,7 +40,10 @@ PatchMethodReturnVoid(currencyType, "Spend");
 Console.WriteLine("[*] Patch 4: Boost currency (Add always adds 999999 extra)...");
 PatchCurrencyAdd(currencyType);
 
-Console.WriteLine("[*] Patch 5: 10x inventory slot capacity...");
+Console.WriteLine("[*] Patch 5: Max level (GetLevelForExp returns last level)...");
+PatchMaxLevel();
+
+Console.WriteLine("[*] Patch 6: 3x inventory slot capacity...");
 PatchInventoryCapacity();
 
 if (patchCount > 0)
@@ -161,6 +164,39 @@ void PatchCurrencyAdd(TypeDefinition? type)
     il.InsertBefore(first, il.Create(OpCodes.Starg, method.Parameters[1]));
     patchCount++;
     Console.WriteLine("    [OK] Add always adds 999999 regardless of input");
+}
+
+void PatchMaxLevel()
+{
+    // LevelsConfig.GetLevelForExp reads _expToLevel array and returns a level.
+    // Patch to: return _expToLevel[_expToLevel.Length - 1].Level  (always max level)
+    var type = module.Types.FirstOrDefault(t => t.FullName == "Features.Levels.LevelsConfig");
+    var method = type?.Methods.FirstOrDefault(m => m.Name == "GetLevelForExp");
+    if (method == null) { Console.WriteLine("    [!] GetLevelForExp not found"); return; }
+
+    // Find the _expToLevel field and the Level field on ExpToLevelConfig
+    var expToLevelField = type!.Fields.FirstOrDefault(f => f.Name == "_expToLevel");
+    var elemType = expToLevelField!.FieldType.GetElementType().Resolve();
+    var levelField = elemType.Fields.FirstOrDefault(f => f.Name == "Level");
+
+    var il = method.Body.GetILProcessor();
+    method.Body.Instructions.Clear();
+
+    // return this._expToLevel[this._expToLevel.Length - 1].Level
+    il.Append(il.Create(OpCodes.Ldarg_0));                          // this
+    il.Append(il.Create(OpCodes.Ldfld, expToLevelField));           // _expToLevel
+    il.Append(il.Create(OpCodes.Ldarg_0));                          // this
+    il.Append(il.Create(OpCodes.Ldfld, expToLevelField));           // _expToLevel
+    il.Append(il.Create(OpCodes.Ldlen));                            // .Length
+    il.Append(il.Create(OpCodes.Conv_I4));                          // convert to int
+    il.Append(il.Create(OpCodes.Ldc_I4_1));                         // 1
+    il.Append(il.Create(OpCodes.Sub));                              // Length - 1
+    il.Append(il.Create(OpCodes.Ldelem_Ref));                       // _expToLevel[Length-1]
+    il.Append(il.Create(OpCodes.Ldfld, module.ImportReference(levelField)));  // .Level
+    il.Append(il.Create(OpCodes.Ret));
+
+    patchCount++;
+    Console.WriteLine("    [OK] GetLevelForExp always returns max level");
 }
 
 void PatchMethodReturnTrue(TypeDefinition? type, string methodName)
